@@ -1,6 +1,6 @@
 # Kite Console
 
-A glass-style React dashboard with switchable dark and light themes and a local FastAPI bridge to Zerodha Kite Connect. Enter your API key, API secret, and request token. The backend exchanges the request token for an access token, saves it in a local ignored file, and never returns it to the frontend.
+A glass-style React dashboard with switchable dark and light themes and a FastAPI bridge to Zerodha Kite Connect. Enter your API key, API secret, and request token. The backend exchanges the request token for an access token and never returns it to the frontend. Local development saves the session in an ignored file; Vercel uses Upstash Redis with the access token encrypted at rest.
 
 The Signals tab loads the current Nifty 100 members from the [official NSE Indices constituent CSV](https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv), maps each symbol to Kite's NSE instrument list, and scans daily candles for bullish and bearish crossovers. It uses closed daily candles and ranks the newest crossovers first. A full scan checks the whole current index and can take around 35 seconds due to Kite historical-data request pacing; **Max stocks** controls how many matching signals are shown.
 
@@ -44,7 +44,7 @@ Kite request tokens expire within minutes, so paste and submit one soon after ge
 
 ## Local session and customization
 
-- FastAPI stores the current API key and access token in `.token_store.json` in the project root. That file is excluded by `.gitignore`; keep it private and never commit it. The API secret and request token are not saved.
+- Locally, FastAPI stores the current API key and access token in `.token_store.json` in the project root. That file is excluded by `.gitignore`; keep it private and never commit it. The API secret and request token are not saved. On Vercel, connect Upstash Redis to the backend project and set `KITE_TOKEN_ENCRYPTION_KEY`; the access token is encrypted before storage.
 - On backend startup, the saved token is restored so restarting Vite, refreshing the page, or changing frontend code does not require another Kite login. Use **Sign out** in the sidebar to clear the saved session. A session may still expire according to Kite's token policy.
 - The browser sends the API key, API secret, and pasted request token to the local backend for the exchange. The access token is never returned to the browser.
 - The API binds to `127.0.0.1` in the commands above and accepts browser requests from the local Vite development URL. Keep it local; this sample does not include user authentication or production deployment controls.

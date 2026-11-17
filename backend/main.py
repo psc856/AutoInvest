@@ -13,8 +13,10 @@ from threading import RLock, Thread
 from typing import Any
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
+from urllib.parse import quote
 
 import requests
+from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +56,10 @@ app.add_middleware(
 )
 
 TOKEN_FILE = Path(__file__).resolve().parent.parent / ".token_store.json"
+_SESSION_REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_REST_API_URL") or ""
+_SESSION_REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_TOKEN") or ""
+_SESSION_REDIS_KEY = "kite-console:session"
+_TOKEN_ENCRYPTION_KEY = os.getenv("KITE_TOKEN_ENCRYPTION_KEY", "")
 _lock = RLock()
 _kite: KiteConnect | None = None
 _instruments: list[dict[str, Any]] | None = None
@@ -81,20 +87,89 @@ class SignalRequest(BaseModel):
         return self
 
 
+def _remote_session_store_enabled() -> bool:
+    configured = bool(_SESSION_REDIS_URL or _SESSION_REDIS_TOKEN)
+    if configured and not (_SESSION_REDIS_URL and _SESSION_REDIS_TOKEN):
+        raise RuntimeError("Upstash Redis is only partially configured; set its REST URL and REST token.")
+    if configured and not _TOKEN_ENCRYPTION_KEY:
+        raise RuntimeError("Set KITE_TOKEN_ENCRYPTION_KEY in the backend environment to encrypt the saved Kite token.")
+    if not configured and (os.getenv("VERCEL") or os.getenv("VERCEL_ENV")):
+        raise RuntimeError("Connect Upstash Redis to the backend Vercel project and set KITE_TOKEN_ENCRYPTION_KEY.")
+    return configured
+
+
+def _redis_request(method: str, key: str, value: str | None = None) -> Any:
+    url = _SESSION_REDIS_URL.rstrip("/")
+    headers = {"Authorization": f"Bearer {_SESSION_REDIS_TOKEN}"}
+    if method == "GET":
+        response = requests.get(f"{url}/get/{quote(key, safe='')}", headers=headers, timeout=8)
+    elif method == "SET":
+        response = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=["SET", key, value], timeout=8)
+    else:
+        response = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=["DEL", key], timeout=8)
+    response.raise_for_status()
+    result = response.json()
+    if result.get("error"):
+        raise RuntimeError("Upstash Redis rejected the session storage request.")
+    return result.get("result")
+
+
+def _read_saved_session() -> dict[str, str] | None:
+    if _remote_session_store_enabled():
+        encoded = _redis_request("GET", _SESSION_REDIS_KEY)
+        if not encoded:
+            return None
+        saved = json.loads(encoded)
+        token = Fernet(_TOKEN_ENCRYPTION_KEY.encode()).decrypt(saved["encrypted_access_token"].encode()).decode()
+        return {"api_key": saved["api_key"], "access_token": token}
+    if not TOKEN_FILE.exists():
+        return None
+    return json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+
+
+def _write_saved_session(api_key: str, access_token: str) -> None:
+    if _remote_session_store_enabled():
+        encrypted = Fernet(_TOKEN_ENCRYPTION_KEY.encode()).encrypt(access_token.encode()).decode()
+        _redis_request("SET", _SESSION_REDIS_KEY, json.dumps({"api_key": api_key, "encrypted_access_token": encrypted}))
+        return
+    TOKEN_FILE.write_text(json.dumps({"api_key": api_key, "access_token": access_token}), encoding="utf-8")
+    try:
+        TOKEN_FILE.chmod(0o600)
+    except OSError:
+        pass  # Windows does not support POSIX file permissions.
+
+
+def _delete_saved_session() -> None:
+    if _remote_session_store_enabled():
+        _redis_request("DEL", _SESSION_REDIS_KEY)
+    else:
+        TOKEN_FILE.unlink(missing_ok=True)
+
+
 def _load_saved_session() -> None:
-    """Restore a local session between backend restarts; never expose its token."""
+    """Restore a persisted session without exposing its token to clients."""
     global _kite
     try:
-        saved = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
-        if saved.get("api_key") and saved.get("access_token"):
+        saved = _read_saved_session()
+        if saved and saved.get("api_key") and saved.get("access_token"):
             client = KiteConnect(api_key=saved["api_key"])
             client.set_access_token(saved["access_token"])
             _kite = client
-    except (OSError, ValueError, KeyError):
+        else:
+            _kite = None
+    except Exception:
         _kite = None
 
 
 _load_saved_session()
+
+
+def _current_kite() -> KiteConnect | None:
+    """Refresh serverless instances from Redis so each request sees the saved session."""
+    if _SESSION_REDIS_URL or _SESSION_REDIS_TOKEN:
+        with _lock:
+            _load_saved_session()
+    return _kite
 
 
 @app.get("/api/health")
@@ -104,7 +179,7 @@ def health() -> dict[str, bool]:
 
 @app.get("/api/auth/status")
 def auth_status() -> dict[str, bool]:
-    return {"authenticated": _kite is not None}
+    return {"authenticated": _current_kite() is not None}
 
 
 @app.post("/api/auth/login")
@@ -120,14 +195,7 @@ def login(payload: LoginPayload) -> dict[str, bool]:
             if not access_token:
                 raise ValueError("Kite did not return an access token.")
             client.set_access_token(access_token)
-            TOKEN_FILE.write_text(
-                json.dumps({"api_key": payload.api_key.strip(), "access_token": access_token}),
-                encoding="utf-8",
-            )
-            try:
-                TOKEN_FILE.chmod(0o600)
-            except OSError:
-                pass  # Windows does not support POSIX file permissions.
+            _write_saved_session(payload.api_key.strip(), access_token)
             _kite = client
         except Exception as exc:
             # Show the SDK's useful failure reason while redacting every submitted credential.
@@ -146,10 +214,11 @@ def login(payload: LoginPayload) -> dict[str, bool]:
 
 @app.get("/api/user/profile")
 def user_profile() -> dict[str, Any]:
-    if _kite is None:
+    client = _current_kite()
+    if client is None:
         raise HTTPException(status_code=401, detail="Please log in to Kite Connect first.")
     try:
-        profile = _kite.profile()
+        profile = client.profile()
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Could not load your profile. Your session may have expired.") from exc
     return {
@@ -169,9 +238,9 @@ def logout() -> dict[str, bool]:
     with _lock:
         _kite = None
         try:
-            TOKEN_FILE.unlink(missing_ok=True)
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail="Could not clear the local session file.") from exc
+            _delete_saved_session()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="Could not clear the saved session.") from exc
     return {"authenticated": False}
 
 
@@ -244,7 +313,8 @@ def _as_date(value: Any) -> date:
 def scanner_data() -> dict[str, Any]:
     """Build and cache the daily candles and instrument metadata used by Algo Signals."""
     global _scanner_cache, _scanner_cache_at
-    if _kite is None:
+    client = _current_kite()
+    if client is None:
         raise HTTPException(status_code=401, detail="Please log in to Kite Connect first.")
     with _scanner_cache_lock:
         if _scanner_cache and time.monotonic() - _scanner_cache_at < 900:
@@ -252,7 +322,7 @@ def scanner_data() -> dict[str, Any]:
 
         nifty100 = _read_index_csv(NIFTY_100_CSV, "Nifty 100")
         nifty50_symbols = {item["symbol"] for item in _read_index_csv(NIFTY_50_CSV, "Nifty 50")}
-        instruments = _get_nse_instruments(_kite)
+        instruments = _get_nse_instruments(client)
         token_by_symbol = {
             item.get("tradingsymbol"): item
             for item in instruments
@@ -268,7 +338,7 @@ def scanner_data() -> dict[str, Any]:
                 missing.append(member["symbol"])
                 continue
             try:
-                history = _kite.historical_data(instrument["instrument_token"], start, today, "day", continuous=False, oi=False)
+                history = client.historical_data(instrument["instrument_token"], start, today, "day", continuous=False, oi=False)
                 candles = [{
                     "date": _as_date(candle["date"]).isoformat(),
                     "open": float(candle["open"]),
@@ -312,13 +382,14 @@ def scanner_data() -> dict[str, Any]:
 
 @app.get("/api/scanner-ohlc")
 def scanner_ohlc(tokens: str = Query(min_length=1, max_length=5000)) -> dict[str, Any]:
-    if _kite is None:
+    client = _current_kite()
+    if client is None:
         raise HTTPException(status_code=401, detail="Please log in to Kite Connect first.")
     requested = {int(value) for value in tokens.split(",") if value.strip().isdigit()}
-    instruments = _get_nse_instruments(_kite)
+    instruments = _get_nse_instruments(client)
     symbols = [f"NSE:{item['tradingsymbol']}" for item in instruments if item.get("instrument_token") in requested]
     try:
-        quotes = _kite.quote(symbols) if symbols else {}
+        quotes = client.quote(symbols) if symbols else {}
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Could not load the Kite OHLC price snapshot.") from exc
     return {"prices": {str(value.get("instrument_token")): value.get("last_price") for value in quotes.values() if value.get("instrument_token") is not None and value.get("last_price") is not None}}
@@ -327,7 +398,8 @@ def scanner_ohlc(tokens: str = Query(min_length=1, max_length=5000)) -> dict[str
 @app.websocket("/ws/ticks")
 async def live_ticks(websocket: WebSocket, tokens: str = Query(min_length=1), mode: str = "full") -> None:
     await websocket.accept()
-    if _kite is None:
+    client = _current_kite()
+    if client is None:
         await websocket.send_json({"type": "status", "status": "unauthenticated"})
         await websocket.close(code=4401)
         return
@@ -339,7 +411,7 @@ async def live_ticks(websocket: WebSocket, tokens: str = Query(min_length=1), mo
 
     loop = asyncio.get_running_loop()
     messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    ticker = KiteTicker(_kite.api_key, _kite.access_token)
+    ticker = KiteTicker(client.api_key, client.access_token)
     ticker.on_connect = lambda ws, response: (ws.subscribe(token_list), ws.set_mode(ws.MODE_FULL if mode == "full" else ws.MODE_LTP, token_list), loop.call_soon_threadsafe(messages.put_nowait, {"type": "status", "status": "connected"}))
     ticker.on_ticks = lambda ws, ticks: loop.call_soon_threadsafe(messages.put_nowait, {"type": "ticks", "ticks": [{"instrument_token": tick.get("instrument_token"), "last_price": tick.get("last_price")} for tick in ticks]})
     ticker.on_close = lambda ws, code, reason: loop.call_soon_threadsafe(messages.put_nowait, {"type": "status", "status": "disconnected"})
@@ -361,11 +433,12 @@ async def live_ticks(websocket: WebSocket, tokens: str = Query(min_length=1), mo
 @app.post("/api/signals")
 def generate_signals(payload: SignalRequest) -> dict[str, Any]:
     """Scan the current Nifty 100 universe for the latest daily SMA crossovers."""
-    if _kite is None:
+    client = _current_kite()
+    if client is None:
         raise HTTPException(status_code=401, detail="Please log in to Kite Connect first.")
 
     constituents = _nifty_constituents()
-    instruments = _get_nse_instruments(_kite)
+    instruments = _get_nse_instruments(client)
     token_by_symbol = {
         item.get("tradingsymbol"): item.get("instrument_token")
         for item in instruments
@@ -384,7 +457,7 @@ def generate_signals(payload: SignalRequest) -> dict[str, Any]:
             skipped += 1
             continue
         try:
-            candles = _kite.historical_data(token, from_date, today, "day", continuous=False, oi=False)
+            candles = client.historical_data(token, from_date, today, "day", continuous=False, oi=False)
             # Ignore today's incomplete daily candle so signals are based on closed sessions.
             candles = [c for c in candles if _as_date(c["date"]) < today]
             scanned += 1
