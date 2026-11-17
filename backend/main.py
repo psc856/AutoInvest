@@ -7,6 +7,9 @@ import os
 import re
 import time
 import asyncio
+import hashlib
+import hmac
+import secrets
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import RLock, Thread
@@ -18,7 +21,7 @@ from urllib.parse import quote
 import requests
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from kiteconnect import KiteConnect
 from kiteconnect import KiteTicker
@@ -50,7 +53,7 @@ if frontend_origin:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
@@ -58,7 +61,8 @@ app.add_middleware(
 TOKEN_FILE = Path(__file__).resolve().parent.parent / ".token_store.json"
 _SESSION_REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_REST_API_URL") or ""
 _SESSION_REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_TOKEN") or ""
-_SESSION_REDIS_KEY = "kite-console:session"
+_SESSION_REDIS_KEY_PREFIX = "kite-console:session:"
+_SESSION_COOKIE = "kite_console_session"
 _TOKEN_ENCRYPTION_KEY = os.getenv("KITE_TOKEN_ENCRYPTION_KEY", "")
 _lock = RLock()
 _kite: KiteConnect | None = None
@@ -98,13 +102,14 @@ def _remote_session_store_enabled() -> bool:
     return configured
 
 
-def _redis_request(method: str, key: str, value: str | None = None) -> Any:
+def _redis_request(method: str, key: str, value: str | None = None, ttl: int | None = None) -> Any:
     url = _SESSION_REDIS_URL.rstrip("/")
     headers = {"Authorization": f"Bearer {_SESSION_REDIS_TOKEN}"}
     if method == "GET":
         response = requests.get(f"{url}/get/{quote(key, safe='')}", headers=headers, timeout=8)
     elif method == "SET":
-        response = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=["SET", key, value], timeout=8)
+        command = ["SET", key, value] + (["EX", ttl] if ttl else [])
+        response = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=command, timeout=8)
     else:
         response = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=["DEL", key], timeout=8)
     response.raise_for_status()
@@ -114,9 +119,11 @@ def _redis_request(method: str, key: str, value: str | None = None) -> Any:
     return result.get("result")
 
 
-def _read_saved_session() -> dict[str, str] | None:
+def _read_saved_session(session_id: str | None = None) -> dict[str, str] | None:
     if _remote_session_store_enabled():
-        encoded = _redis_request("GET", _SESSION_REDIS_KEY)
+        if not session_id:
+            return None
+        encoded = _redis_request("GET", f"{_SESSION_REDIS_KEY_PREFIX}{session_id}")
         if not encoded:
             return None
         saved = json.loads(encoded)
@@ -127,10 +134,12 @@ def _read_saved_session() -> dict[str, str] | None:
     return json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
 
 
-def _write_saved_session(api_key: str, access_token: str) -> None:
+def _write_saved_session(api_key: str, access_token: str, session_id: str | None = None) -> None:
     if _remote_session_store_enabled():
+        if not session_id:
+            raise RuntimeError("A browser session is required to save the Kite session.")
         encrypted = Fernet(_TOKEN_ENCRYPTION_KEY.encode()).encrypt(access_token.encode()).decode()
-        _redis_request("SET", _SESSION_REDIS_KEY, json.dumps({"api_key": api_key, "encrypted_access_token": encrypted}))
+        _redis_request("SET", f"{_SESSION_REDIS_KEY_PREFIX}{session_id}", json.dumps({"api_key": api_key, "encrypted_access_token": encrypted}), ttl=86400)
         return
     TOKEN_FILE.write_text(json.dumps({"api_key": api_key, "access_token": access_token}), encoding="utf-8")
     try:
@@ -139,9 +148,10 @@ def _write_saved_session(api_key: str, access_token: str) -> None:
         pass  # Windows does not support POSIX file permissions.
 
 
-def _delete_saved_session() -> None:
+def _delete_saved_session(session_id: str | None = None) -> None:
     if _remote_session_store_enabled():
-        _redis_request("DEL", _SESSION_REDIS_KEY)
+        if session_id:
+            _redis_request("DEL", f"{_SESSION_REDIS_KEY_PREFIX}{session_id}")
     else:
         TOKEN_FILE.unlink(missing_ok=True)
 
@@ -161,14 +171,33 @@ def _load_saved_session() -> None:
         _kite = None
 
 
-_load_saved_session()
+if not (_SESSION_REDIS_URL or _SESSION_REDIS_TOKEN):
+    _load_saved_session()
 
 
-def _current_kite() -> KiteConnect | None:
-    """Refresh serverless instances from Redis so each request sees the saved session."""
+def _signed_session_cookie(session_id: str) -> str:
+    signature = hmac.new(_TOKEN_ENCRYPTION_KEY.encode(), session_id.encode(), hashlib.sha256).hexdigest()
+    return f"{session_id}.{signature}"
+
+
+def _session_id_from_cookie(cookie: str | None) -> str | None:
+    if not cookie or "." not in cookie:
+        return None
+    session_id, signature = cookie.rsplit(".", 1)
+    expected = hmac.new(_TOKEN_ENCRYPTION_KEY.encode(), session_id.encode(), hashlib.sha256).hexdigest()
+    return session_id if hmac.compare_digest(signature, expected) else None
+
+
+def _current_kite(request: Request | WebSocket) -> KiteConnect | None:
+    """Load the Kite session belonging to this browser, never a shared global cloud session."""
     if _SESSION_REDIS_URL or _SESSION_REDIS_TOKEN:
-        with _lock:
-            _load_saved_session()
+        session_id = _session_id_from_cookie(request.cookies.get(_SESSION_COOKIE))
+        saved = _read_saved_session(session_id)
+        if saved and saved.get("api_key") and saved.get("access_token"):
+            client = KiteConnect(api_key=saved["api_key"])
+            client.set_access_token(saved["access_token"])
+            return client
+        return None
     return _kite
 
 
@@ -178,12 +207,12 @@ def health() -> dict[str, bool]:
 
 
 @app.get("/api/auth/status")
-def auth_status() -> dict[str, bool]:
-    return {"authenticated": _current_kite() is not None}
+def auth_status(request: Request) -> dict[str, bool]:
+    return {"authenticated": _current_kite(request) is not None}
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginPayload) -> dict[str, bool]:
+def login(payload: LoginPayload, request: Request, response: Response) -> dict[str, bool]:
     global _kite
     with _lock:
         try:
@@ -195,8 +224,13 @@ def login(payload: LoginPayload) -> dict[str, bool]:
             if not access_token:
                 raise ValueError("Kite did not return an access token.")
             client.set_access_token(access_token)
-            _write_saved_session(payload.api_key.strip(), access_token)
-            _kite = client
+            remote_store = _remote_session_store_enabled()
+            session_id = secrets.token_urlsafe(32) if remote_store else None
+            _write_saved_session(payload.api_key.strip(), access_token, session_id)
+            if remote_store:
+                response.set_cookie(_SESSION_COOKIE, _signed_session_cookie(session_id), httponly=True, secure=True, samesite="none", max_age=86400, path="/")
+            else:
+                _kite = client
         except Exception as exc:
             # Show the SDK's useful failure reason while redacting every submitted credential.
             message = str(getattr(exc, "message", str(exc)) or exc)
@@ -213,8 +247,8 @@ def login(payload: LoginPayload) -> dict[str, bool]:
 
 
 @app.get("/api/user/profile")
-def user_profile() -> dict[str, Any]:
-    client = _current_kite()
+def user_profile(request: Request) -> dict[str, Any]:
+    client = _current_kite(request)
     if client is None:
         raise HTTPException(status_code=401, detail="Please log in to Kite Connect first.")
     try:
@@ -232,13 +266,14 @@ def user_profile() -> dict[str, Any]:
 
 
 @app.post("/api/auth/logout")
-def logout() -> dict[str, bool]:
+def logout(request: Request, response: Response) -> dict[str, bool]:
     """Forget the local token so the next visit returns to the login screen."""
     global _kite
     with _lock:
         _kite = None
         try:
-            _delete_saved_session()
+            _delete_saved_session(_session_id_from_cookie(request.cookies.get(_SESSION_COOKIE)))
+            response.delete_cookie(_SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="none")
         except Exception as exc:
             raise HTTPException(status_code=500, detail="Could not clear the saved session.") from exc
     return {"authenticated": False}
@@ -310,10 +345,10 @@ def _as_date(value: Any) -> date:
 
 
 @app.get("/api/scanner-data")
-def scanner_data() -> dict[str, Any]:
+def scanner_data(request: Request) -> dict[str, Any]:
     """Build and cache the daily candles and instrument metadata used by Algo Signals."""
     global _scanner_cache, _scanner_cache_at
-    client = _current_kite()
+    client = _current_kite(request)
     if client is None:
         raise HTTPException(status_code=401, detail="Please log in to Kite Connect first.")
     with _scanner_cache_lock:
@@ -381,8 +416,8 @@ def scanner_data() -> dict[str, Any]:
 
 
 @app.get("/api/scanner-ohlc")
-def scanner_ohlc(tokens: str = Query(min_length=1, max_length=5000)) -> dict[str, Any]:
-    client = _current_kite()
+def scanner_ohlc(request: Request, tokens: str = Query(min_length=1, max_length=5000)) -> dict[str, Any]:
+    client = _current_kite(request)
     if client is None:
         raise HTTPException(status_code=401, detail="Please log in to Kite Connect first.")
     requested = {int(value) for value in tokens.split(",") if value.strip().isdigit()}
@@ -397,8 +432,11 @@ def scanner_ohlc(tokens: str = Query(min_length=1, max_length=5000)) -> dict[str
 
 @app.websocket("/ws/ticks")
 async def live_ticks(websocket: WebSocket, tokens: str = Query(min_length=1), mode: str = "full") -> None:
+    if websocket.headers.get("origin") not in allowed_origins:
+        await websocket.close(code=4403)
+        return
     await websocket.accept()
-    client = _current_kite()
+    client = _current_kite(websocket)
     if client is None:
         await websocket.send_json({"type": "status", "status": "unauthenticated"})
         await websocket.close(code=4401)
@@ -431,9 +469,9 @@ async def live_ticks(websocket: WebSocket, tokens: str = Query(min_length=1), mo
 
 
 @app.post("/api/signals")
-def generate_signals(payload: SignalRequest) -> dict[str, Any]:
+def generate_signals(payload: SignalRequest, request: Request) -> dict[str, Any]:
     """Scan the current Nifty 100 universe for the latest daily SMA crossovers."""
-    client = _current_kite()
+    client = _current_kite(request)
     if client is None:
         raise HTTPException(status_code=401, detail="Please log in to Kite Connect first.")
 
