@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Activity, ArrowDownLeft, ArrowRight, ArrowUpRight, BadgeCheck, BarChart3, Check, CircleHelp, Command, Fingerprint, KeyRound, LayoutDashboard, LoaderCircle, LockKeyhole, LogOut, Moon, Radio, RefreshCw, ScanLine, ShieldCheck, SlidersHorizontal, Sun, UserRound } from 'lucide-react'
 
-const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const configuredApi = import.meta.env.VITE_API_URL?.trim().replace(/\/+$/, '')
+const API = configuredApi || (import.meta.env.DEV ? 'http://localhost:8000' : window.location.origin)
 
 async function request(path, options) {
   const response = await fetch(`${API}${path}`, options)

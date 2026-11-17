@@ -40,9 +40,14 @@ app = FastAPI(
     docs_url="/documentation",
     redoc_url="/redoc",
 )
+frontend_origin = os.getenv("FRONTEND_ORIGIN", "").strip().rstrip("/")
+allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+if frontend_origin:
+    allowed_origins.append(frontend_origin)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
